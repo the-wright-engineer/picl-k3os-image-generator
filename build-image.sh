@@ -2,6 +2,13 @@
 
 set -e
 
+
+# Set this to default to a KNOWN GOOD pi firmware (e.g. 1.20200811); this is used if RASPBERRY_PI_FIRMWARE env variable is not specified
+DEFAULT_GOOD_PI_VERSION="1.20200811"
+
+# Set this to default to a KNOWN GOOD k3os (e.g. v0.11.0); this is used if K3OS_VERSION env variable is not specified
+DEFAULT_GOOD_K3OS_VERSION="v0.11.0"
+
 ## Check if we have any configs
 if [ -z "$(ls config/*.yaml)" ]; then
 	echo "There are no .yaml files in config/, please create them." >&2
@@ -18,11 +25,39 @@ assert_tool() {
 	fi
 }
 
+get_pifirmware() {
+    #  Uses RASPBERRY_PI_FIRMWARE env variable to allow the user to control which pi firmware version to use.
+    # - 1. unset, in which case it is initialized to a known good version (DEFAULT_GOOD_PI_VERSION)
+    # - 2. set to "latest" in which case it pulls the latest firmware from git repo.
+    # - 3. set by the user to desired version
+
+    if [ -z "${RASPBERRY_PI_FIRMWARE}" ]; then
+        echo "RASPBERRY_PI_FIRMWARE env variable was not set - defaulting to known good firmware [${DEFAULT_GOOD_PI_VERSION}]"
+        dl_dep raspberrypi-firmware.tar.gz https://github.com/raspberrypi/firmware/archive/"${DEFAULT_GOOD_PI_VERSION}".tar.gz
+    elif [ "${RASPBERRY_PI_FIRMWARE}" = "latest" ]; then
+        echo "RASPBERRY_PI_FIRMWARE env variable set to 'latest' - using latest pi firmware release"
+        dl_dep raspberrypi-firmware.tar.gz "$(wget -qO - https://api.github.com/repos/raspberrypi/firmware/tags | jq -r '.[0].tarball_url')"
+    else
+        # set to requested version, but first check if it is a valid version
+        for i in $(wget -qO - https://api.github.com/repos/raspberrypi/firmware/tags | jq  --arg RASPBERRY_PI_FIRMWARE "${RASPBERRY_PI_FIRMWARE}" -r '.[].tarball_url | contains($RASPBERRY_PI_FIRMWARE)')
+        do
+            if [ "$i" = "true" ]; then FOUND=true; break; fi
+        done
+        if [ "${FOUND}" = true ]; then
+            echo "RASPBERRY_PI_FIRMWARE env variable set to [${RASPBERRY_PI_FIRMWARE}] - will use this firmware."
+            dl_dep raspberrypi-firmware.tar.gz https://github.com/raspberrypi/firmware/archive/"${RASPBERRY_PI_FIRMWARE}".tar.gz
+        else
+            echo "Requested raspberry pi firmware [${RASPBERRY_PI_FIRMWARE}] is not valid (does not exist in pi firmware repo)! Exiting Build!"
+            exit 1;
+        fi
+    fi
+}
+
 assert_tool wget
 assert_tool mktemp
-assert_tool fallocate
+assert_tool truncate
 assert_tool parted
-assert_tool kpartx
+assert_tool partprobe
 assert_tool losetup
 assert_tool mkfs.fat
 assert_tool mkfs.ext4
@@ -31,14 +66,14 @@ assert_tool e2label
 assert_tool mktemp
 assert_tool ar
 assert_tool blkid
-assert_tool realpath
 assert_tool 7z
 assert_tool dd
+assert_tool jq
 
 ## Check if we are building a supported image
 IMAGE_TYPE=$1
 
-if [ -z "$IMAGE_TYPE" ]; then
+if [ -z "$IMAGE_TYPE" -o "$IMAGE_TYPE" = "help" -o "$IMAGE_TYPE" = "--help" -o "$IMAGE_TYPE" = "-h" ]; then
 	echo "Usage: $0 <image type>" >&2
 	echo "Supported image types:" >&2
 	echo "  raspberrypi - Raspberry Pi model 3B+/4." >&2
@@ -54,7 +89,7 @@ elif [ "$IMAGE_TYPE" = "all" ]; then
 	$0 "orangepipc2"
 	exit 0
 else
-	echo "Unsupported image type \"$IMAGE_TYPE\"." >&2
+	echo "Unsupported image type \"$IMAGE_TYPE\". See \"$0 help\" for more information." >&2
 	exit 1
 fi
 
@@ -75,7 +110,7 @@ function dl_dep() {
 mkdir -p deps
 
 if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	dl_dep raspberrypi-firmware.tar.gz https://github.com/raspberrypi/firmware/archive/1.20200212.tar.gz
+	get_pifirmware
 elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
 	# TODO: apt.armbian.com removes old versions, so these URLs become
 	# outdated. Find an armbian mirror that keeps old versions so that
@@ -93,7 +128,13 @@ elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
 	fi
 fi
 
-dl_dep k3os-rootfs-arm64.tar.gz https://github.com/rancher/k3os/releases/download/v0.10.0/k3os-rootfs-arm64.tar.gz
+if [ -z "${K3OS_VERSION}" ]; then
+    echo "K3OS_VERSION env variable was not set - defaulting to known version [${DEFAULT_GOOD_K3OS_VERSION}]"
+    dl_dep k3os-rootfs-arm64.tar.gz https://github.com/rancher/k3os/releases/download/${DEFAULT_GOOD_K3OS_VERSION}/k3os-rootfs-arm64.tar.gz
+else
+    echo "K3OS_VERSION env variable set to ${K3OS_VERSION}"
+    dl_dep k3os-rootfs-arm64.tar.gz https://github.com/rancher/k3os/releases/download/${K3OS_VERSION}/k3os-rootfs-arm64.tar.gz
+fi
 
 # To find the URL for these packages:
 # - Go to https://launchpad.net/ubuntu/bionic/arm64/<package name>/
@@ -127,10 +168,10 @@ if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
 	# Create two partitions: boot and root.
 	BOOT_CAPACITY=60
 	# Initial root size. The partition will be resized to the SD card's maximum on first boot.
-	ROOT_CAPACITY=800
+	ROOT_CAPACITY=1000
 	IMAGE_SIZE=$(($BOOT_CAPACITY + $ROOT_CAPACITY))
 
-	fallocate -l ${IMAGE_SIZE}M $IMAGE
+	truncate -s ${IMAGE_SIZE}M $IMAGE
 	parted -s $IMAGE mklabel msdos
 	parted -s $IMAGE unit MB mkpart primary fat32 1 $BOOT_CAPACITY
 	parted -s $IMAGE unit MB mkpart primary $(($BOOT_CAPACITY+1)) $IMAGE_SIZE
@@ -139,7 +180,7 @@ elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
 	# Create a single partition; bootloader is copied from armbian
 	# at specific locations before the first partition. The partition
 	# will be resized to the SD card's maximum on first boot.
-	fallocate -l 600M $IMAGE
+	truncate -s 600M $IMAGE
 	parted -s $IMAGE mklabel msdos
 	parted -s $IMAGE unit s mkpart primary 8192 100%
 
@@ -148,15 +189,15 @@ elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
 fi
 
 LODEV=`sudo losetup --show -f $IMAGE`
-sudo kpartx -a $LODEV
+sudo partprobe -s $LODEV
 sleep 1
 
 if [ "$IMAGE_TYPE" = "raspberrypi" ]; then
-	LODEV_BOOT=/dev/mapper/`basename ${LODEV}`p1
-	LODEV_ROOT=/dev/mapper/`basename ${LODEV}`p2
+	LODEV_BOOT=${LODEV}p1
+	LODEV_ROOT=${LODEV}p2
 	sudo mkfs.fat $LODEV_BOOT
 elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
-	LODEV_ROOT=/dev/mapper/`basename ${LODEV}`p1
+	LODEV_ROOT=${LODEV}p1
 fi
 
 sudo mkfs.ext4 -F $LODEV_ROOT
@@ -200,11 +241,11 @@ kernel=kernel8.img
 [all]
 EOF
 	PARTUUID=$(sudo blkid -o export $LODEV_ROOT | grep PARTUUID)
-	echo "dwc_otg.lpm_enable=0 root=$PARTUUID rootfstype=ext4 elevator=deadline fsck.repair=yes rootwait init=/sbin/init.resizefs" | sudo tee boot/cmdline.txt >/dev/null
+	echo "dwc_otg.lpm_enable=0 root=$PARTUUID rootfstype=ext4 elevator=deadline cgroup_memory=1 cgroup_enable=memory rootwait init=/sbin/init.resizefs ro" | sudo tee boot/cmdline.txt >/dev/null
 	sudo rm -rf $PITEMP
 elif [ "$IMAGE_TYPE" = "orangepipc2" ]; then
 	cat <<EOF | sudo tee root/boot/env.txt >/dev/null
-extraargs=elevator=deadline init=/sbin/init.resizefs
+extraargs=elevator=deadline rootwait init=/sbin/init.resizefs ro
 EOF
 	sudo install -m 0644 -o root -g root orangepipc2-boot.cmd root/boot/boot.cmd
 	sudo mkimage -C none -A arm -T script -d root/boot/boot.cmd root/boot/boot.scr
@@ -281,15 +322,17 @@ elif [ "$IMAGE_TYPE" = "raspberrypi" ]; then
   rm -rf "$BRCMTMP"
 fi
 
-## Add tarball for the libraries and binaries needed to resize root FS
-mkdir root-resize
-unpack_deb "libcom-err2-arm64.deb" "root-resize"
-unpack_deb "libblkid1-arm64.deb" "root-resize"
-unpack_deb "libuuid1-arm64.deb" "root-resize"
-unpack_deb "libext2fs2-arm64.deb" "root-resize"
-unpack_deb "e2fsprogs-arm64.deb" "root-resize"
+## Add libraries and binaries needed to resize root FS & fsck every boot
+unpack_deb "libcom-err2-arm64.deb" "root"
+unpack_deb "libblkid1-arm64.deb" "root"
+unpack_deb "libuuid1-arm64.deb" "root"
+unpack_deb "libext2fs2-arm64.deb" "root"
+unpack_deb "e2fsprogs-arm64.deb" "root"
+unpack_deb "util-linux-arm64.deb" "root"
 
+## Add tarball for the libraries and binaries needed only to resize root FS
 # TODO: replace parted by fdisk/sfdisk if simpler?
+mkdir root-resize
 unpack_deb "parted-arm64.deb" "root-resize"
 unpack_deb "libparted2-arm64.deb" "root-resize"
 unpack_deb "libreadline7-arm64.deb" "root-resize"
@@ -299,13 +342,12 @@ unpack_deb "libselinux1-arm64.deb" "root-resize"
 unpack_deb "libudev1-arm64.deb" "root-resize"
 unpack_deb "libpcre3-arm64.deb" "root-resize"
 
-unpack_deb "util-linux-arm64.deb" "root-resize"
 sudo tar -cJf root/root-resize.tar.xz "root-resize"
 sudo rm -rf root-resize
 
 ## Write a resizing init and a pre-init
 sudo install -m 0755 -o root -g root init.preinit init.resizefs root/sbin
-sudo sed -i "s#@IMAGE_TYPE@#$IMAGE_TYPE#" root/sbin/init.resizefs
+sudo sed -i "s#@IMAGE_TYPE@#$IMAGE_TYPE#" root/sbin/init.resizefs root/sbin/init.preinit
 
 ## Clean up
 sync
@@ -316,8 +358,6 @@ fi
 sudo umount root
 rmdir root
 sync
-sleep 1
-sudo kpartx -d $LODEV
 sleep 1
 sudo losetup -d $LODEV
 
